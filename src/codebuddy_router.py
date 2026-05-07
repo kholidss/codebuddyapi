@@ -1003,7 +1003,7 @@ async def test_credential(request: Request, _token: str = Depends(authenticate))
 
         # 构建最小测试payload（CodeBuddy要求stream=true且至少2条消息）
         test_payload = {
-            "model": "claude-opus-4.6",
+            "model": "claude-sonnet-4.5",
             "messages": [
                 {"role": "system", "content": "You are a helpful assistant."},
                 {"role": "user", "content": "test"}
