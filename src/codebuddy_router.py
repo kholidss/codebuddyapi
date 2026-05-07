@@ -431,24 +431,16 @@ class CodeBuddyStreamService:
         self.connection_manager = SSEConnectionManager(max_retries=3, retry_delay=1.0)
     
     def _handle_api_error(self, status_code: int, error_msg: str) -> None:
-        """统一的API错误处理 - 直接抛出异常"""
+        """统一的API错误处理 - 非200/201一律返回500"""
         logger.error(f"CodeBuddy API错误: {status_code} - {error_msg}")
-        
-        if status_code == 401:
-            raise HTTPException(status_code=401, detail="CodeBuddy API authentication failed")
-        elif status_code == 429:
-            raise HTTPException(status_code=429, detail="CodeBuddy API rate limit exceeded")
-        elif status_code >= 500:
-            raise HTTPException(status_code=502, detail="CodeBuddy API server error")
-        else:
-            raise HTTPException(status_code=status_code, detail=f"CodeBuddy API error: {error_msg}")
+        raise HTTPException(status_code=500, detail=f"CodeBuddy API error: {status_code} - {error_msg}")
     
     async def handle_stream_response(self, payload: Dict[str, Any], headers: Dict[str, str]) -> StreamingResponse:
         """处理流式响应 - 使用OpenAI兼容性转换器修复格式问题"""
         async def stream_core():
             client = await get_http_client()
             async with client.stream("POST", get_codebuddy_api_url(), json=payload, headers=headers) as response:
-                if response.status_code != 200:
+                if response.status_code not in (200, 201):
                     error_text = await response.aread()
                     error_msg = error_text.decode('utf-8', errors='ignore')
                     yield format_sse_error(f"CodeBuddy API error: {response.status_code} - {error_msg}", "api_error")
@@ -580,7 +572,7 @@ class CodeBuddyStreamService:
             client = await get_http_client()
             response = await client.post(get_codebuddy_api_url(), json=payload, headers=headers)
             
-            if response.status_code != 200:
+            if response.status_code not in (200, 201):
                 error_msg = response.text
                 self._handle_api_error(response.status_code, error_msg)
             
@@ -588,10 +580,10 @@ class CodeBuddyStreamService:
             
         except httpx.TimeoutException:
             logger.error("CodeBuddy API 超时")
-            raise HTTPException(status_code=504, detail="CodeBuddy API timeout")
+            raise HTTPException(status_code=500, detail="CodeBuddy API timeout")
         except httpx.NetworkError as e:
             logger.error(f"网络错误: {e}")
-            raise HTTPException(status_code=502, detail=f"Network error: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Network error: {str(e)}")
         except HTTPException:
             raise
         except Exception as e:
@@ -765,7 +757,7 @@ async def chat_completions(
                         logger.warning(f"Attempt {attempt} failed: {last_error}")
                         failed_tokens.add(current_token)
                         if is_test_credential:
-                            raise HTTPException(status_code=response.status_code, detail=last_error)
+                            raise HTTPException(status_code=500, detail=last_error)
                         continue
                 except HTTPException:
                     raise
@@ -774,7 +766,7 @@ async def chat_completions(
                     logger.warning(f"Attempt {attempt} exception: {last_error}")
                     failed_tokens.add(current_token)
                     if is_test_credential:
-                        raise HTTPException(status_code=502, detail=f"Request failed: {last_error}")
+                        raise HTTPException(status_code=500, detail=f"Request failed: {last_error}")
                     continue
             else:
                 # 非流式请求
@@ -791,7 +783,7 @@ async def chat_completions(
                         logger.warning(f"Attempt {attempt} failed: {last_error}")
                         failed_tokens.add(current_token)
                         if is_test_credential:
-                            raise HTTPException(status_code=response.status_code, detail=last_error)
+                            raise HTTPException(status_code=500, detail=last_error)
                         continue
                 except HTTPException:
                     raise
@@ -800,19 +792,19 @@ async def chat_completions(
                     logger.warning(f"Attempt {attempt} timeout")
                     failed_tokens.add(current_token)
                     if is_test_credential:
-                        raise HTTPException(status_code=504, detail=last_error)
+                        raise HTTPException(status_code=500, detail=last_error)
                     continue
                 except Exception as e:
                     last_error = str(e)
                     logger.warning(f"Attempt {attempt} exception: {last_error}")
                     failed_tokens.add(current_token)
                     if is_test_credential:
-                        raise HTTPException(status_code=502, detail=f"Request failed: {last_error}")
+                        raise HTTPException(status_code=500, detail=f"Request failed: {last_error}")
                     continue
         
         # All retries exhausted
         logger.error(f"All {max_retries} attempts failed. Last error: {last_error}")
-        raise HTTPException(status_code=502, detail=f"All credential attempts failed. Last error: {last_error}")
+        raise HTTPException(status_code=500, detail=f"All credential attempts failed. Last error: {last_error}")
                 
     except HTTPException:
         raise
