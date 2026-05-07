@@ -5,6 +5,7 @@ CodeBuddy API Router - 兼容CodeBuddy官方API格式
 import json
 import time
 import uuid
+import random
 import logging
 import asyncio
 from typing import Optional, Dict, Any, List, AsyncGenerator
@@ -114,6 +115,7 @@ lifecycle_manager = AppLifecycleManager()
 SSE_HEADERS = {
     "Cache-Control": "no-cache",
     "Connection": "keep-alive",
+    "X-Accel-Buffering": "no",
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
     "Access-Control-Allow-Headers": "*"
@@ -456,7 +458,7 @@ class CodeBuddyStreamService:
                 tool_call_index_map = {}  # 用于跟踪工具调用ID到index的映射
                 
                 
-                async for chunk in response.aiter_text(chunk_size=8192):
+                async for chunk in response.aiter_text():
                     if not chunk:
                         continue
                     
@@ -466,14 +468,13 @@ class CodeBuddyStreamService:
                     while '\n' in buffer:
                         line, buffer = buffer.split('\n', 1)
                         
-                        # 跳过空行和注释行
+                        # Skip upstream SSE delimiters/comments; converted chunks already include \n\n
                         if not line.strip() or line.startswith(':'):
                             continue
                         
                         # 检查是否结束
                         if '[DONE]' in line:
-                            
-                            yield line + '\n'
+                            yield line + '\n\n'
                             return
                         
                         # 解析SSE数据
@@ -484,9 +485,9 @@ class CodeBuddyStreamService:
                                 chunk_data, tool_call_index_map
                             )
                             
-                            # 重新格式化为SSE格式并发送
+                            # 重新格式化为SSE格式并发送 (SSE spec: data line + empty line)
                             converted_line = f"data: {json.dumps(converted_chunk, ensure_ascii=False)}"
-                            yield converted_line + '\n'
+                            yield converted_line + '\n\n'
                         else:
                             # 非数据行直接转发
                             yield line + '\n'
@@ -499,7 +500,7 @@ class CodeBuddyStreamService:
                             chunk_data, tool_call_index_map
                         )
                         converted_line = f"data: {json.dumps(converted_chunk, ensure_ascii=False)}"
-                        yield converted_line + '\n'
+                        yield converted_line + '\n\n'
                     else:
                         yield buffer + '\n'
         
@@ -508,6 +509,70 @@ class CodeBuddyStreamService:
                 yield chunk
         
         return StreamingResponse(stream_with_retry(), media_type="text/event-stream", headers=SSE_HEADERS)
+    
+    async def _stream_from_response(self, response) -> AsyncGenerator[str, None]:
+        """从已打开的upstream response中stream SSE chunks给client"""
+        buffer = ""
+        tool_call_index_map = {}
+        
+        async for chunk in response.aiter_text():
+            if not chunk:
+                continue
+            
+            buffer += chunk
+            
+            while '\n' in buffer:
+                line, buffer = buffer.split('\n', 1)
+                
+                if not line.strip() or line.startswith(':'):
+                    continue
+                
+                if '[DONE]' in line:
+                    yield line + '\n\n'
+                    return
+                
+                chunk_data = parse_sse_line(line)
+                if chunk_data:
+                    converted_chunk = OpenAICompatibilityConverter.convert_sse_chunk_to_openai_format(
+                        chunk_data, tool_call_index_map
+                    )
+                    converted_line = f"data: {json.dumps(converted_chunk, ensure_ascii=False)}"
+                    yield converted_line + '\n\n'
+                else:
+                    yield line + '\n'
+        
+        if buffer.strip():
+            chunk_data = parse_sse_line(buffer.strip())
+            if chunk_data:
+                converted_chunk = OpenAICompatibilityConverter.convert_sse_chunk_to_openai_format(
+                    chunk_data, tool_call_index_map
+                )
+                converted_line = f"data: {json.dumps(converted_chunk, ensure_ascii=False)}"
+                yield converted_line + '\n\n'
+            else:
+                yield buffer + '\n'
+    
+    async def _aggregate_response(self, response) -> Dict[str, Any]:
+        """从已打开的upstream response中聚合为非流式响应"""
+        aggregator = StreamResponseAggregator()
+        buffer = ""
+        
+        async for chunk in response.aiter_text():
+            if not chunk:
+                continue
+            buffer += chunk
+            while '\n' in buffer:
+                line, buffer = buffer.split('\n', 1)
+                obj = parse_sse_line(line)
+                if obj:
+                    aggregator.process_chunk(obj)
+        
+        if buffer.strip():
+            obj = parse_sse_line(buffer.strip())
+            if obj:
+                aggregator.process_chunk(obj)
+        
+        return aggregator.finalize()
     
     async def handle_non_stream_response(self, payload: Dict[str, Any], headers: Dict[str, str]) -> Dict[str, Any]:
         """处理非流式响应 - 使用修复后的聚合器，支持多工具调用"""
@@ -519,25 +584,7 @@ class CodeBuddyStreamService:
                 error_msg = response.text
                 self._handle_api_error(response.status_code, error_msg)
             
-            aggregator = StreamResponseAggregator()
-            buffer = ""
-            
-            async for chunk in response.aiter_text():
-                if not chunk:
-                    continue
-                buffer += chunk
-                while '\n' in buffer:
-                    line, buffer = buffer.split('\n', 1)
-                    obj = parse_sse_line(line)
-                    if obj:
-                        aggregator.process_chunk(obj)
-            
-            if buffer.strip():
-                obj = parse_sse_line(buffer.strip())
-                if obj:
-                    aggregator.process_chunk(obj)
-            
-            return aggregator.finalize()
+            return await self._aggregate_response(response)
             
         except httpx.TimeoutException:
             logger.error("CodeBuddy API 超时")
@@ -612,6 +659,21 @@ class CredentialManager:
         except Exception as e:
             logger.error(f"获取凭证失败: {e}")
             raise HTTPException(status_code=401, detail="凭证获取失败")
+    
+    @staticmethod
+    def get_random_credential_excluding(exclude_tokens: set) -> Optional[Dict[str, Any]]:
+        """获取随机凭证，排除已失败的token"""
+        all_credentials = codebuddy_token_manager.get_all_credentials()
+        # Filter: valid token, not expired, not in exclude list
+        candidates = [
+            cred for cred in all_credentials
+            if cred.get('bearer_token')
+            and cred.get('bearer_token') not in exclude_tokens
+            and not codebuddy_token_manager.is_token_expired(cred)
+        ]
+        if not candidates:
+            return None
+        return random.choice(candidates)
 
 # --- API Endpoints ---
 
@@ -622,9 +684,10 @@ async def chat_completions(
     x_conversation_request_id: Optional[str] = Header(None, alias="X-Conversation-Request-ID"),
     x_conversation_message_id: Optional[str] = Header(None, alias="X-Conversation-Message-ID"),
     x_request_id: Optional[str] = Header(None, alias="X-Request-ID"),
+    x_test_credential: Optional[str] = Header(None, alias="X-Test-Credential"),
     _token: str = Depends(authenticate)
 ):
-    """CodeBuddy V1 聊天完成API - 重构后的简洁版本"""
+    """CodeBuddy V1 聊天完成API - 支持凭证重试"""
     try:
         # 解析和验证请求体
         try:
@@ -636,31 +699,120 @@ async def chat_completions(
         # 验证请求参数
         RequestProcessor.validate_request(request_body)
         
-        # 获取有效凭证
-        credential = CredentialManager.get_valid_credential()
-        
-        # 生成请求头
-        headers = codebuddy_api_client.generate_codebuddy_headers(
-            bearer_token=credential.get('bearer_token'),
-            user_id=credential.get('user_id'),
-            conversation_id=x_conversation_id,
-            conversation_request_id=x_conversation_request_id,
-            conversation_message_id=x_conversation_message_id,
-            request_id=x_request_id
-        )
-        
         # 预处理请求
         payload = RequestProcessor.prepare_payload(request_body)
         usage_stats_manager.record_model_usage(payload.get("model", "unknown"))
         
-        # 使用服务类处理请求
-        service = CodeBuddyStreamService()
         client_wants_stream = request_body.get("stream", False)
+        is_test_credential = x_test_credential and x_test_credential.lower() == "true"
+        max_retries = 1 if is_test_credential else 5
         
-        if client_wants_stream:
-            return await service.handle_stream_response(payload, headers)
-        else:
-            return await service.handle_non_stream_response(payload, headers)
+        failed_tokens = set()
+        last_error = None
+        
+        for attempt in range(1, max_retries + 1):
+            # 获取凭证: 首次用正常轮换, 重试用随机(排除已失败的)
+            if attempt == 1:
+                credential = CredentialManager.get_valid_credential()
+            else:
+                credential = CredentialManager.get_random_credential_excluding(failed_tokens)
+                if not credential:
+                    logger.error(f"No more credentials available after {attempt - 1} retries")
+                    break
+            
+            current_token = credential.get('bearer_token')
+            logger.info(f"Attempt {attempt}/{max_retries} - credential: {current_token[:10]}...")
+            
+            # 生成请求头
+            headers = codebuddy_api_client.generate_codebuddy_headers(
+                bearer_token=current_token,
+                user_id=credential.get('user_id'),
+                conversation_id=x_conversation_id,
+                conversation_request_id=x_conversation_request_id,
+                conversation_message_id=x_conversation_message_id,
+                request_id=x_request_id
+            )
+            
+            # 流式请求: probe upstream status, 成功则stream给client
+            if client_wants_stream:
+                try:
+                    client = await get_http_client()
+                    # 用send()手动管理response生命周期，避免async with提前关闭
+                    req = client.build_request("POST", get_codebuddy_api_url(), json=payload, headers=headers)
+                    response = await client.send(req, stream=True)
+                    
+                    if response.status_code in (200, 201):
+                        # 成功 - stream给client, response在generator结束后关闭
+                        service = CodeBuddyStreamService()
+                        
+                        async def stream_and_close(resp):
+                            try:
+                                async for chunk in service._stream_from_response(resp):
+                                    yield chunk
+                            finally:
+                                await resp.aclose()
+                        
+                        return StreamingResponse(
+                            stream_and_close(response),
+                            media_type="text/event-stream",
+                            headers=SSE_HEADERS
+                        )
+                    else:
+                        error_text = await response.aread()
+                        await response.aclose()
+                        error_msg = error_text.decode('utf-8', errors='ignore')
+                        last_error = f"CodeBuddy API error: {response.status_code} - {error_msg}"
+                        logger.warning(f"Attempt {attempt} failed: {last_error}")
+                        failed_tokens.add(current_token)
+                        if is_test_credential:
+                            raise HTTPException(status_code=response.status_code, detail=last_error)
+                        continue
+                except HTTPException:
+                    raise
+                except Exception as e:
+                    last_error = str(e)
+                    logger.warning(f"Attempt {attempt} exception: {last_error}")
+                    failed_tokens.add(current_token)
+                    if is_test_credential:
+                        raise HTTPException(status_code=502, detail=f"Request failed: {last_error}")
+                    continue
+            else:
+                # 非流式请求
+                try:
+                    client = await get_http_client()
+                    response = await client.post(get_codebuddy_api_url(), json=payload, headers=headers)
+                    
+                    if response.status_code in (200, 201):
+                        service = CodeBuddyStreamService()
+                        return await service._aggregate_response(response)
+                    else:
+                        error_msg = response.text
+                        last_error = f"CodeBuddy API error: {response.status_code} - {error_msg}"
+                        logger.warning(f"Attempt {attempt} failed: {last_error}")
+                        failed_tokens.add(current_token)
+                        if is_test_credential:
+                            raise HTTPException(status_code=response.status_code, detail=last_error)
+                        continue
+                except HTTPException:
+                    raise
+                except httpx.TimeoutException:
+                    last_error = "CodeBuddy API timeout"
+                    logger.warning(f"Attempt {attempt} timeout")
+                    failed_tokens.add(current_token)
+                    if is_test_credential:
+                        raise HTTPException(status_code=504, detail=last_error)
+                    continue
+                except Exception as e:
+                    last_error = str(e)
+                    logger.warning(f"Attempt {attempt} exception: {last_error}")
+                    failed_tokens.add(current_token)
+                    if is_test_credential:
+                        raise HTTPException(status_code=502, detail=f"Request failed: {last_error}")
+                    continue
+        
+        # All retries exhausted
+        logger.error(f"All {max_retries} attempts failed. Last error: {last_error}")
+        raise HTTPException(status_code=502, detail=f"All credential attempts failed. Last error: {last_error}")
                 
     except HTTPException:
         raise
@@ -732,15 +884,15 @@ async def add_credential(
         if not data.get("bearer_token"):
             raise HTTPException(status_code=422, detail="bearer_token is required")
 
-        success = codebuddy_token_manager.add_credential(
+        saved_filename = codebuddy_token_manager.add_credential(
             data.get("bearer_token"),
             data.get("user_id"),
             data.get("filename")
         )
-        if not success:
+        if not saved_filename:
             raise HTTPException(status_code=500, detail="Failed to save credential file")
         
-        return {"message": "Credential added successfully"}
+        return {"message": "Credential added successfully", "filename": saved_filename}
 
     except Exception as e:
         logger.error(f"添加凭证失败: {e}")
@@ -810,22 +962,88 @@ async def get_current_credential(_token: str = Depends(authenticate)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.post("/v1/credentials/delete", summary="Delete a credential by index")
+@router.post("/v1/credentials/delete", summary="Delete a credential by filename")
 async def delete_credential(request: Request, _token: str = Depends(authenticate)):
-    """删除一个凭证文件（通过索引）并从列表中移除"""
+    """删除一个凭证文件（通过文件名）并从列表中移除"""
     try:
         data = await request.json()
-        index = data.get("index")
-        if index is None or not isinstance(index, int):
-            raise HTTPException(status_code=422, detail="Valid integer index is required")
+        filename = data.get("filename")
+        if not filename or not isinstance(filename, str):
+            raise HTTPException(status_code=422, detail="Valid filename string is required")
 
-        if not codebuddy_token_manager.delete_credential_by_index(index):
-            raise HTTPException(status_code=400, detail="Invalid index or failed to delete credential")
+        if not codebuddy_token_manager.delete_credential_by_filename(filename):
+            raise HTTPException(status_code=400, detail=f"Credential file '{filename}' not found or failed to delete")
 
-        return {"message": f"Credential #{index + 1} deleted successfully"}
+        return {"message": f"Credential '{filename}' deleted successfully"}
 
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"删除凭证失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/v1/credentials/test", summary="Test a credential by filename")
+async def test_credential(request: Request, _token: str = Depends(authenticate)):
+    """通过文件名测试指定凭证是否有效（发送最小chat completion请求）"""
+    try:
+        data = await request.json()
+        filename = data.get("filename")
+        if not filename or not isinstance(filename, str):
+            raise HTTPException(status_code=422, detail="Valid filename string is required")
+
+        # 根据文件名获取凭证
+        credential = codebuddy_token_manager.get_credential_by_filename(filename)
+        if not credential:
+            raise HTTPException(status_code=404, detail=f"Credential file '{filename}' not found")
+
+        bearer_token = credential.get('bearer_token')
+        if not bearer_token:
+            raise HTTPException(status_code=400, detail=f"Credential '{filename}' has no bearer_token")
+
+        # 构建最小测试payload（CodeBuddy要求stream=true且至少2条消息）
+        test_payload = {
+            "model": "claude-opus-4.6",
+            "messages": [
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": "test"}
+            ],
+            "max_tokens": 1,
+            "stream": True
+        }
+
+        # 生成请求头
+        headers = codebuddy_api_client.generate_codebuddy_headers(
+            bearer_token=bearer_token,
+            user_id=credential.get('user_id')
+        )
+
+        # 发送测试请求（流式，只检查status code）
+        client = await get_http_client()
+        req = client.build_request("POST", get_codebuddy_api_url(), json=test_payload, headers=headers)
+        response = await client.send(req, stream=True)
+
+        try:
+            if response.status_code in (200, 201):
+                return {
+                    "status": "valid",
+                    "filename": filename,
+                    "message": f"Credential '{filename}' is valid"
+                }
+            else:
+                error_body = (await response.aread()).decode('utf-8', errors='ignore')
+                return {
+                    "status": "invalid",
+                    "filename": filename,
+                    "message": f"Credential '{filename}' test failed",
+                    "error": error_body,
+                    "status_code": response.status_code
+                }
+        finally:
+            await response.aclose()
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"测试凭证失败: {e}")
         raise HTTPException(status_code=500, detail=str(e))

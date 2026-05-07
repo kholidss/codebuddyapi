@@ -2266,10 +2266,10 @@
                                             <i class="fas fa-hand-pointer"></i>
                                         </button>` : ''
                                     }
-                                    <button class="btn btn-success" onclick="testCredential(${index})" title="测试凭证">
+                                    <button class="btn btn-success" onclick="testCredential('${cred.filename}', ${index})" title="测试凭证">
                                         <i class="fas fa-check"></i>
                                     </button>
-                                    <button class="btn btn-danger" onclick="deleteCredential(${index})" title="删除凭证">
+                                    <button class="btn btn-danger" onclick="deleteCredential('${cred.filename}')" title="删除凭证">
                                         <i class="fas fa-trash"></i>
                                     </button>
                                 </div>
@@ -2323,7 +2323,7 @@
                             <button class="btn btn-warning" onclick="selectCredential(${index})" title="手动选择此凭证">
                                 <i class="fas fa-hand-pointer"></i> 选择
                             </button>
-                            <button class="btn btn-success" onclick="testCredential(${index})">
+                            <button class="btn btn-success" onclick="testCredential('${cred.filename}', ${index})">
                                 <i class="fas fa-check"></i> 测试
                             </button>
                         </div>
@@ -2332,13 +2332,13 @@
             '</div>';
         }
 
-        async function deleteCredential(index) {
-            if (!confirm(`确定要删除凭证 #${index + 1} 吗？此操作不可恢复。`)) return;
+        async function deleteCredential(filename) {
+            if (!confirm(`确定要删除凭证 "${filename}" 吗？此操作不可恢复。`)) return;
             try {
                 const response = await fetch('/codebuddy/v1/credentials/delete', {
                     method: 'POST',
                     headers: getAuthHeaders(),
-                    body: JSON.stringify({ index })
+                    body: JSON.stringify({ filename })
                 });
                 if (response.ok) {
                     const data = await response.json();
@@ -2517,40 +2517,37 @@
             }
         }
 
-        async function testCredential(index) {
-            showNotification(`正在测试凭证 #${index + 1}...`, 'info');
+        async function testCredential(filename, index) {
+            showNotification(`正在测试凭证 "${filename}"...`, 'info');
             
-            // 找到要测试的凭证的原始数据
-            const originalCred = credentialsCache[index];
-            if (!originalCred) return;
+            if (!filename) return;
 
             try {
-                const response = await fetch('/codebuddy/v1/chat/completions', {
+                const response = await fetch('/codebuddy/v1/credentials/test', {
                     method: 'POST',
                     headers: getAuthHeaders(),
-                    body: JSON.stringify({
-                        // 在后端，token管理器是轮换的，我们无法直接指定用哪个token
-                        // 所以这里的测试实际上是测试下一个将被轮换到的token
-                        // 为了更精确，理想的后端应该有一个专门的测试接口
-                        // 但在当前架构下，这是最好的模拟
-                        model: 'claude-4.0',
-                        messages: [{ role: 'user', content: 'test' }],
-                        max_tokens: 1
-                    })
+                    body: JSON.stringify({ filename })
                 });
                 
-                if (response.ok) {
-                    showNotification(`凭证 #${index + 1} 测试成功！ ✓`, 'success');
-                    credentialsCache[index].status = 'valid';
+                const data = await response.json();
+                
+                if (response.ok && data.status === 'valid') {
+                    showNotification(`凭证 "${filename}" 测试成功！ ✓`, 'success');
+                    if (index !== undefined && credentialsCache[index]) {
+                        credentialsCache[index].status = 'valid';
+                    }
                 } else {
-                     showNotification(`凭证 #${index + 1} 无效或已过期 ✗`, 'error');
-                    credentialsCache[index].status = 'invalid';
+                    showNotification(`凭证 "${filename}" 无效或已过期 ✗`, 'error');
+                    if (index !== undefined && credentialsCache[index]) {
+                        credentialsCache[index].status = 'invalid';
+                    }
                 }
             } catch (error) {
                 showNotification(`网络错误: ${error.message}`, 'error');
-                credentialsCache[index].status = 'invalid';
+                if (index !== undefined && credentialsCache[index]) {
+                    credentialsCache[index].status = 'invalid';
+                }
             } finally {
-                // 重新渲染列表以更新图标
                 displayCredentials();
             }
         }

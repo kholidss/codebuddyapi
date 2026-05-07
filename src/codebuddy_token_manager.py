@@ -278,8 +278,8 @@ class CodeBuddyTokenManager:
         
         return credentials_info
     
-    def add_credential(self, bearer_token: str, user_id: str = None, filename: str = None) -> bool:
-        """添加新的凭证（简化版本，向后兼容）"""
+    def add_credential(self, bearer_token: str, user_id: str = None, filename: str = None) -> str:
+        """添加新的凭证（简化版本，向后兼容）。返回文件名或None"""
         if not filename:
             filename = f"codebuddy_token_{len(self.credentials) + 1}.json"
         
@@ -294,8 +294,8 @@ class CodeBuddyTokenManager:
         
         return self.add_credential_with_data(credential_data, filename)
     
-    def add_credential_with_data(self, credential_data: Dict[str, Any], filename: str = None) -> bool:
-        """添加新的凭证（完整数据版本）"""
+    def add_credential_with_data(self, credential_data: Dict[str, Any], filename: str = None) -> str:
+        """添加新的凭证（完整数据版本）。返回文件名或None"""
         if not filename:
             user_id = credential_data.get('user_id', 'unknown')
             timestamp = credential_data.get('created_at', int(time.time()))
@@ -321,10 +321,10 @@ class CodeBuddyTokenManager:
             
             logger.info(f"Added new credential: {filename}")
             self.load_all_tokens()  # 重新加载
-            return True
+            return filename
         except Exception as e:
             logger.error(f"Failed to save credential: {e}")
-            return False
+            return None
 
     def delete_credential_by_index(self, index: int) -> bool:
         """删除指定索引的凭证文件，并重新加载列表"""
@@ -352,6 +352,33 @@ class CodeBuddyTokenManager:
         except Exception as e:
             logger.error(f"Failed to delete credential at index {index}: {e}")
             return False
+
+    def delete_credential_by_filename(self, filename: str) -> bool:
+        """删除指定文件名的凭证文件，并重新加载列表"""
+        try:
+            # 查找匹配的凭证
+            target_index = None
+            for i, cred in enumerate(self.credentials):
+                if os.path.basename(cred['file_path']) == filename:
+                    target_index = i
+                    break
+
+            if target_index is None:
+                logger.error(f"Credential file not found: {filename}")
+                return False
+
+            return self.delete_credential_by_index(target_index)
+        except Exception as e:
+            logger.error(f"Failed to delete credential by filename {filename}: {e}")
+            return False
+
+    def get_credential_by_filename(self, filename: str) -> Optional[Dict[str, Any]]:
+        """根据文件名获取凭证数据，返回凭证data或None"""
+        for cred in self.credentials:
+            if os.path.basename(cred['file_path']) == filename:
+                return cred['data']
+        logger.error(f"Credential not found by filename: {filename}")
+        return None
 
     def set_manual_credential(self, index: int) -> bool:
         """手动选择指定索引的凭证"""
