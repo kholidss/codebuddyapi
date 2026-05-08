@@ -1,11 +1,13 @@
 """
 CodeBuddy Token Manager - 管理CodeBuddy认证token
 """
+from contextlib import contextmanager
 import os
 import glob
 import json
 import time
 import logging
+import threading
 from typing import Dict, Optional, List, Any
 from .usage_stats_manager import usage_stats_manager
 
@@ -27,8 +29,12 @@ class CodeBuddyTokenManager:
         self.usage_count = 0    # Counter for the current credential usage
         self.manual_selected_index = None  # 手动选择的凭证索引
         self.auto_rotation_enabled = True  # 自动轮换开关，默认开启
+        self._add_lock = threading.Lock()
         self.load_all_tokens()
-        self.load_state()  # 加载保存的状态
+
+    @contextmanager
+    def _noop_cm(self):
+        yield
     
     def load_all_tokens(self):
         """加载所有token文件"""
@@ -278,53 +284,76 @@ class CodeBuddyTokenManager:
         
         return credentials_info
     
+    def _is_filename_duplicate(self, filename: str) -> bool:
+        existing_filenames = {os.path.basename(c['file_path']) for c in self.credentials}
+        return filename in existing_filenames
+
     def add_credential(self, bearer_token: str, user_id: str = None, filename: str = None) -> str:
         """添加新的凭证（简化版本，向后兼容）。返回文件名或None"""
-        if not filename:
-            filename = f"codebuddy_token_{len(self.credentials) + 1}.json"
-        
-        if not filename.endswith('.json'):
-            filename += '.json'
-        
-        credential_data = {
-            "bearer_token": bearer_token,
-            "user_id": user_id,
-            "created_at": int(time.time())
-        }
-        
-        return self.add_credential_with_data(credential_data, filename)
+        with self._add_lock:
+            if not filename:
+                base = "codebuddy_token"
+                filename = f"{base}_{len(self.credentials) + 1}.json"
+                if self._is_filename_duplicate(filename):
+                    n = len(self.credentials) + 1
+                    while self._is_filename_duplicate(f"{base}_{n}.json"):
+                        n += 1
+                    filename = f"{base}_{n}.json"
+            else:
+                if not filename.endswith('.json'):
+                    filename += '.json'
+                if self._is_filename_duplicate(filename):
+                    logger.error(f"Filename already exists: {filename}")
+                    return None
+
+            credential_data = {
+                "bearer_token": bearer_token,
+                "user_id": user_id,
+                "created_at": int(time.time())
+            }
+
+            return self.add_credential_with_data(credential_data, filename, _skip_lock=True)
     
-    def add_credential_with_data(self, credential_data: Dict[str, Any], filename: str = None) -> str:
+    def add_credential_with_data(self, credential_data: Dict[str, Any], filename: str = None, _skip_lock: bool = False) -> str:
         """添加新的凭证（完整数据版本）。返回文件名或None"""
-        if not filename:
-            user_id = credential_data.get('user_id', 'unknown')
-            timestamp = credential_data.get('created_at', int(time.time()))
-            safe_user_id = "".join(c for c in str(user_id) if c.isalnum() or c in "._-")[:20]
-            filename = f"codebuddy_{safe_user_id}_{timestamp}.json"
-        
-        if not filename.endswith('.json'):
-            filename += '.json'
-        
-        file_path = os.path.join(self.creds_dir, filename)
-        
-        # 确保必要字段存在
-        if 'created_at' not in credential_data:
-            credential_data['created_at'] = int(time.time())
-        
-        try:
-            # 确保目录存在
-            if not os.path.exists(self.creds_dir):
-                os.makedirs(self.creds_dir)
-            
-            with open(file_path, 'w', encoding='utf-8') as f:
-                json.dump(credential_data, f, indent=4, ensure_ascii=False)
-            
-            logger.info(f"Added new credential: {filename}")
-            self.load_all_tokens()  # 重新加载
-            return filename
-        except Exception as e:
-            logger.error(f"Failed to save credential: {e}")
-            return None
+        with self._add_lock if not _skip_lock else self._noop_cm():
+            if not filename:
+                user_id = credential_data.get('user_id', 'unknown')
+                timestamp = credential_data.get('created_at', int(time.time()))
+                safe_user_id = "".join(c for c in str(user_id) if c.isalnum() or c in "._-")[:20]
+                filename = f"codebuddy_{safe_user_id}_{timestamp}.json"
+
+            if not filename.endswith('.json'):
+                filename += '.json'
+
+            if self._is_filename_duplicate(filename):
+                logger.error(f"Filename already exists: {filename}")
+                return None
+
+            file_path = os.path.join(self.creds_dir, filename)
+
+            if 'created_at' not in credential_data:
+                credential_data['created_at'] = int(time.time())
+
+            try:
+                if not os.path.exists(self.creds_dir):
+                    os.makedirs(self.creds_dir)
+
+                with open(file_path, 'x', encoding='utf-8') as f:
+                    json.dump(credential_data, f, indent=4, ensure_ascii=False)
+
+                logger.info(f"Added new credential: {filename}")
+                self.load_all_tokens()
+                return filename
+            except FileExistsError:
+                logger.error(f"File already exists (race): {filename}")
+                return None
+            except Exception as e:
+                logger.error(f"Failed to save credential: {e}")
+                # Cleanup partial file
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+                return None
 
     def delete_credential_by_index(self, index: int) -> bool:
         """删除指定索引的凭证文件，并重新加载列表"""
